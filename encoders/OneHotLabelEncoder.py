@@ -1,3 +1,13 @@
+"""
+OneHotLabelEncoder
+"""
+
+# Author: Alvin Thai <alvinthai@gmail.com>
+
+from __future__ import division
+from collections import defaultdict
+
+import itertools
 import numpy as np
 import pandas as pd
 
@@ -9,188 +19,325 @@ class OneHotLabelEncoder(BaseEstimator, TransformerMixin):
     '''
     A class for performing a label encoding and one hot encoding sequentially.
     Can handle numerical, categorical, and missing inputs. Also recodes any
-    unknown inputs found in transform step as no found value for one hot
-    encoding. Fit and transform objects MUST be pandas DataFrame.
+    unknown inputs found in transform step as an 'ignore_<feature_name>' value
+    for one hot encoding. Fit and transform objects MUST be pandas DataFrame.
 
     Parameters
     ----------
-    label: str
-        Column in DataFrame to perform One Hot Label Encoding.
-    delete: boolean, default: True
-        Whether to delete the label column from DataFrame after transformation
-    output_missing_col: boolean, default: False.
+    labels: list, optional
+        Columns in DataFrame to fit OneHotLabelEncoder. If not provided,
+        categorical columns from DataFrame will automatically be selected.
+
+    top: int, float, or dict of numerics, optional
+        Available option for reducing the cardinality of the LabelEncoder.
+        - If int, selects <top> most frequent label values from each column.
+        - If float (between 0 and 1), selects <top> percent most frequent label
+          values from each column.
+        - If dict (key = column label, value = int or float), user can
+          explicitly set int or float <top> rules for specific columns.
+        - If None (default), no label value filtering is performed.
+
+        NOTE: <top> will not attempt to break ties. You may see more than <top>
+              encoded labels if there is a tie in the value counts.
+
+    concat: bool, optional, default: True
+        Whether to concatenate the original data table to the DataFrame from
+        the transform step of OneHotLabelEncoder.
+
+    delete: boolean, optional, default: True
+        Whether to delete the label column from DataFrame after transformation.
+
+    ignore_col: boolean, optional, default: False
+        Whether to output an indicator column for ignored values. Ignored
+        values include unknown values found in the transform step and filtered
+        values that do not satisfy the requirements for the top parameter.
+
+    missing_col: boolean, optional, default: False
         Whether to output an indicator column for missing values, should
         specify to True if expecting missing values.
-    missing_fill:
-        An indicator value used to fill in label encoding when values are
-        missing, should be different than unique values in input column.
     '''
-    def __init__(self, label, delete=True, output_missing_col=False,
-                 missing_fill=-999999.0):
-        self._le = LabelEncoder()
-        self._ohe = OneHotEncoder(sparse=False, handle_unknown='ignore')
+    def __init__(self, labels=None, top=None, concat=True, delete=True,
+                 ignore_col=False, missing_col=False):
+        self._keep = dict()
+        self._le = defaultdict(LabelEncoder)
 
-        self.label = label
+        self.labels = labels
+        self.top = top
+        self.concat = concat
         self.delete = delete
-        self.output_missing_col = output_missing_col
-        self.missing_fill = missing_fill
+        self.ignore_col = ignore_col
+        self.missing_col = missing_col
 
-    def _delete_columns(self, X, data):
+        if self.labels is None:
+            self.labels = []
+
+    def _fit_impute(self, X):
         '''
-        Utility function for deleting label column from input DataFrame and
-        missing column for OneHotEncoded values in the output DataFrame. The
-        deletion of these columns is controlled by the init parameters.
+        Assigns and imputes ignored and missing values for each feature that
+        LabelEncoder will be fitting.
 
         Parameters
         ----------
         X: DataFrame, shape = [n_samples, n_features]
-            Original DataFrame before OneHotLabelEncoding.
-        data: DataFrame, shape = [n_samples, n_classes + 1]
-            OneHotEncodedDataFrame with extra column as indicator for missing
-            values.
+            Input DataFrame for fitting OneHotLabelEncoder.
         '''
-        if self.delete:
-            del X[self.label]
+        n = len(X)
 
-        if not self.output_missing_col:
-            if 'missing_' + self.label in data.columns:
-                del data['missing_' + self.label]
+        self._impute_ignore = dict()
+        self._impute_missing = dict()
+        self._n_unq = dict()
 
-    def _label_transform(self, classes, ncols):
-        '''
-        Function for outputing column names for one hot encoding numpy array.
-        Prepends column name to unique value from OneHotLabelEncoding.
-
-        Parameters
-        ----------
-        classes: list
-            List of unique values from OneHotLabelEncoder column.
-        ncols: int
-            Number of columns in OneHotLabelEncoder DataFrame. If equals to
-            n_classes + 1, there is an indicator column for missing values.
-
-        Returns
-        -------
-        output: list of str
-            List of column names for OneHotLabelEncoder DataFrame.
-        '''
-        classes = np.char.array(classes)
-        output = []
-
-        for x in classes:
-            if str(self.missing_fill) == x:
-                output.append('missing_' + self.label)
+        for col in self.labels:
+            if X[col].dtype == object:
+                self._impute_ignore[col] = u'\uffff'
+                self._impute_missing[col] = u'\uffff'u'\uffff'
             else:
-                output.append(self.label + '_' + x)
+                col_max = X[col].max()
+                self._impute_ignore[col] = col_max + 1
+                self._impute_missing[col] = col_max + 2
 
-        # Transform DataFrame has missing values and fit DataFrame does not
-        if len(classes) == ncols - 1:
-                output.append('missing_' + self.label)
+            missing = X[col].isnull()
 
-        return output
+            if col in self._keep:  # ignore unknown non-missing values
+                ignore = np.logical_and(~X[col].isin(self._keep[col]),
+                                        ~missing)
+                self._n_unq[col] = len(self._keep[col])
+            else:  # ignore nothing
+                ignore = np.zeros(n).astype(bool)
+                self._n_unq[col] = len(X[col].unique()) - (missing.sum() > 0)
 
-    def _na_transform(self, y):
+            X.loc[ignore, col] = self._impute_ignore[col]
+            X.loc[missing, col] = self._impute_missing[col]
+
+    def _fit_reduce_cardinality(self, X, cols, top):
         '''
-        Turns missing values to an indicator value (i.e. -999999) prior to
-        label transform.
+        Reduces cardinality of the LabelEncoder by selecting the <top> most
+        common label values or <top> percent most frequent label values from
+        encoded columns. Values not belonging to the <top> label values will
+        be treated as unknown values to OneHotLabelEncoder and are assigned to
+        the 'ignore_<feature_name>' column.
+
+        NOTE: <top> will not attempt to break ties. You may see more than <top>
+              encoded labels if there is a tie in the value counts.
 
         Parameters
         ----------
-        y: array-like, shape = [n_samples, ]
-            Input values from column to be OneHotLabelEncoder transformed.
+        X: DataFrame, shape = [n_samples, n_features]
+            Input DataFrame for fitting OneHotLabelEncoder.
 
-        Returns
-        -------
-        y: array-like, shape = [n_samples, ]
-            Input values with missing values converted to a spurious value.
+        cols: list
+            Columns in DataFrame to fit OneHotLabelEncoder.
+
+        top: int, float, or dict of numerics, optional
+            Available option for reducing the cardinality of the LabelEncoder.
+            - If int, selects <top> most frequent label values from each column
+            - If float (between 0 and 1), selects <top> percent most frequent
+              label values from each column.
+            - If dict (key = column label, value = int or float), user can
+              explicitly set int or float <top> rules for specific columns.
+            - If None (default), no label value filtering is performed.
         '''
-        mask = y.isnull()
+        mode = 'none'
 
-        if mask.sum():
-            if self.missing_fill in y.unique():
-                raise AssertionError('NA fill error. Please initialize class '
-                                     'with a missing_fill value not found in '
-                                     'column.')
+        if isinstance(top, (int, float, type(None))):
+            if top >= 1:
+                mode = 'int'
+            elif top > 0:
+                mode = 'ratio'
+        elif isinstance(top, dict):
+            # recursive call
+            for k, v in top.iteritems():
+                self._fit_reduce_cardinality(X, [k], v)
 
-            if y.dtype == object:
-                y.loc[mask] = str(self.missing_fill)
-            elif y.dtype in (int, float):
-                y.loc[mask] = self.missing_fill
+        if mode == 'int':
+            for col in cols:
+                y = X[col]
 
-        return y
+                if top >= len(y.unique()):
+                    continue
 
-    def _output_missing_col(self, data, ncols, missing_mask, classes):
+                # get descending value counts
+                cnt_desc = y.value_counts()
+
+                # keep top n distinct values and ties
+                keeps = cnt_desc >= cnt_desc.iloc[top-1]
+
+                self._keep[col] = set(keeps[keeps].index)
+
+        elif mode == 'ratio':
+            for col in cols:
+                y = X[col]
+
+                # get descending value counts and ratios
+                cnt_desc, ratios = self._get_value_count_desc(y)
+
+                # keep distinct values that make up top % of data and ties
+                keep = ratios < top
+                keep = np.logical_or(keep,
+                                     cnt_desc == cnt_desc.iloc[sum(keep) - 1])
+
+                self._keep[col] = set(keep[keep].index)
+
+    def _get_categorical(self, X):
         '''
-        Adds indicator column for missing values.
+        Executes when no labels are specified by user during initation.
+        Automatically chooses columns to perform OneHotLabelEncoder based on
+        the data type of column values.
 
         Parameters
         ----------
-        data: DataFrame, shape = [n_samples, n_encoded_features]
-            DataFrame with a column for each unique value found in the
-            OneHotLabelEncoder fitting step.
-        ncols: int
-            Count of unique values in OneHotLabelEncoder fitted column.
-        missing_mask: array-like, shape = [n_samples, ]
-            Array of True or False labels indicating whether the value was
-            missing from the column specified in OneHotLabelEncoder.
-        classes: list
-            List of unique values from OneHotLabelEncoder fitted columns.
-
-        Returns
-        -------
-        data: DataFrame, shape = [n_samples, n_encoded_features (+ 1)]
-            If self.output_missing_col is True, outputs data with an additional
-            column that indicates if the value was missing from the
-            OneHotLabelEncoder column.
-        ncols: int
-            If self.output_missing_col is True, returns the column dimension of
-            the OneHotLabelEncoder DataFrame (input ncols + 1).
+        X: DataFrame, shape = [n_samples, n_features]
+            Input DataFrame for fitting OneHotLabelEncoder.
         '''
-        if self.output_missing_col:
-            misscol = np.zeros(len(data))
+        n = len(X)
 
-            # Missing values found in transform and not in fit
-            if missing_mask is not None:
-                misscol[missing_mask] = 1
+        for col, dtype in X.dtypes.iteritems():
+            if dtype == object:
+                # check if all values in column are distinct
+                if len(X[col].unique()) == n:
+                    continue
+                else:
+                    self.labels.append(col)
 
-            # Missing values not found in fit
-            if str(self.missing_fill) not in classes:
-                # Add column for missing values
-                data = np.hstack([data, misscol.reshape(-1, 1)])
-                ncols += 1
-
-        return data, ncols
-
-    def _unknown_transform(self, y, unknown):
+    def _get_value_count_desc(self, y):
         '''
-        Turns unknown values found in transform into an invalid label encoder
-        value. OneHotEncoder will return 0 on all columns with unknown values.
+        Gets histogram values (in descending order) and percentage of data
+        belonging to more frequent label values for a categorical column.
 
         Parameters
         ----------
-        y: array-like, shape = [n_samples, ]
-            Input values (with or without unknown values not seen in fit step)
-            from column to be OneHotLabelEncoder transformed.
-        unknown: set
-            A set of unknown values not seen in the fit step.
+        y: Series, shape = [n_samples, ]
+            Input column to calculate histogram values for.
 
         Returns
         -------
-        y: array-like, shape = [n_samples, ]
-            LabelEncoder transformed y values. Unknown values are set to a
-            value not seen in the OneHotEncoder fit step:
-            len(self._le.classes_).
+        cnt_desc: Series, shape = [n_unique_values, ]
+            Histogram values (in descending order) of unique labels from column
+
+        ratios: Series, shape = [n_unique_values, ]
+            Tells us the start index if the data column was sorted in
+            descending order by the histogram count. This number is normalized
+            into [0, 1) range to output percentage of data belonging to label
+            values occurring more frequently than the current label.
         '''
-        mask = y.isin(unknown)
+        cnt = len(y)
+        cnt_desc = y.value_counts()
 
-        # Set unknown values to a valid label
-        y[mask] = self._le.inverse_transform(0)
-        y = self._le.transform(y)
+        cnt_desc_hist_idx = cnt_desc.shift(1).cumsum().fillna(0)
+        ratios = cnt_desc_hist_idx / cnt
 
-        # Set unknown values to an invalid class
-        y[mask] = len(self._le.classes_)
+        return cnt_desc, ratios
 
-        return y
+    def _name_columns(self, X_out):
+        '''
+        Function for naming columns in OneHotEncoder DataFrame.
+        - Prepends feature name to label values from OneHotLabelEncoder.
+        - If value is ignored, prepends ignore to feature name.
+        - If value is missing, prepends missing to feature name.
+
+        Parameters
+        ----------
+        X_out: DataFrame, shape = [n_samples, encoded_features]
+            Transfomed DataFrame from OneHotEncoder with unnamed columns.
+
+        Returns
+        -------
+        X_out: DataFrame, shape = [n_samples, encoded_features]
+            Transformed DataFrame from OneHotEncoder with named columns.
+        '''
+        cols = np.repeat(self.labels, self._ohe.n_values_).astype(object)
+
+        indexes = zip(self._ohe.feature_indices_,
+                      self._ohe.feature_indices_[1:] - 2)
+
+        for i, (j, k) in enumerate(indexes):
+            lbl = self.labels[i]
+            vals = self._le[lbl].classes_[:k-j]
+
+            subcols = np.char.array(cols[j:k]) + '_' + vals.astype(str)
+
+            cols[j:k] = subcols
+            cols[k] = 'ignore_' + str(lbl)
+            cols[k+1] = 'missing_' + str(lbl)
+
+        X_out.columns = cols
+        return X_out
+
+    def _select_columns(self, X, X_out):
+        '''
+        Selects columns to output when returning transform results.
+
+        Parameters
+        ----------
+        X: DataFrame, shape = [n_samples, n_features]
+            Original input DataFrame from transform step.
+
+        X_out: DataFrame, shape = [n_samples, encoded_features]
+            Transformed DataFrame from OneHotEncoder with named columns.
+
+        Returns
+        -------
+        X_out: DataFrame, shape = [n_samples, (n_features +) encoded_features]
+            Original DataFrame with OneHotLabelEncoder columns.
+        '''
+        cols_out = np.arange(X_out.shape[1])
+        ohe_idx = self._ohe.feature_indices_
+        ohe_classes = self._ohe.n_values_
+
+        if not self.ignore_col:
+            drop = ohe_idx[:-1] + ohe_classes - 2
+            cols_out = np.setdiff1d(cols_out, drop)
+
+        if not self.missing_col:
+            drop = ohe_idx[:-1] + ohe_classes - 1
+            cols_out = np.setdiff1d(cols_out, drop)
+
+        if not self.concat:
+            return X_out.iloc[:, cols_out]
+        else:
+            X_out = pd.concat([X, X_out], axis=1)
+
+        n_cols_in = X.shape[1]
+        cols_in = np.arange(n_cols_in).tolist()
+
+        # reorder columns so that encoded columns appear in-place
+        label_idx = [X.columns.tolist().index(lbl) for lbl in self.labels]
+        zipped = sorted(zip(label_idx, ohe_idx, ohe_idx[1:]), reverse=True)
+        cols_in = map(lambda c: [c], cols_in)
+
+        for i, j, k in zipped:
+            mask = np.logical_and(cols_out >= j, cols_out < k)
+            cols_in.insert(i + 1, cols_out[mask] + n_cols_in)
+
+        cols_in = list(itertools.chain(*cols_in))
+        X_out = X_out.iloc[:, cols_in]
+
+        if self.delete:
+            X_out = X_out.drop(self.labels, axis=1)
+
+        return X_out
+
+    def _transform_impute(self, X):
+        '''
+        Imputes ignored and missing values prior to LabelEncoder transform.
+
+        Parameters
+        ----------
+        X: DataFrame, shape = [n_samples, n_features]
+            Input DataFrame to be transformed.
+        '''
+        n = len(X)
+
+        for col in self.labels:
+            classes = self._le[col].classes_
+            n_unq = self._n_unq[col]
+
+            missing = X[col].isnull()
+            ignore = ~X[col].isin(set(classes[:n_unq]))
+            ignore = np.logical_or(ignore, X[col].isin(set(classes[n_unq:])))
+
+            X.loc[ignore, col] = self._impute_ignore[col]
+            X.loc[missing, col] = self._impute_missing[col]
 
     def fit(self, X, y=None):
         '''
@@ -199,7 +346,8 @@ class OneHotLabelEncoder(BaseEstimator, TransformerMixin):
         Parameters
         ----------
         X: DataFrame, shape = [n_samples, n_features]
-            Input DataFrame for fitting the OneHotLabelEncoder transformer.
+            Input DataFrame for fitting OneHotLabelEncoder.
+
         y: optional
             Passthrough for Pipeline compatibility.
 
@@ -207,10 +355,38 @@ class OneHotLabelEncoder(BaseEstimator, TransformerMixin):
         -------
         self
         '''
-        y = self._na_transform(X[self.label].copy())
+        X = X.copy()
+        n_values = []
 
-        data = self._le.fit_transform(y)
-        self._ohe.fit(data.reshape(-1, 1))
+        if len(self.labels) == 0:
+            self._get_categorical(X)
+
+        self._fit_reduce_cardinality(X, self.labels, self.top)
+        self._fit_impute(X)
+
+        for col in self.labels:
+            n_unq = self._n_unq[col]
+            v_ignore = self._impute_ignore[col]
+            v_miss = self._impute_missing[col]
+
+            # specify number of classes to expect for OneHotEncoder
+            n_values.append(n_unq + 2)
+
+            enc = self._le[col]
+            enc.fit(X[col])  # fit LabelEncoder for column
+
+            # overwrite classes_ attribute with imputation labels
+            enc.classes_ = np.hstack([enc.classes_[:n_unq], v_ignore, v_miss])
+            # transform LabelEncoder prior to fitting OneHotEncoding
+            X[col] = enc.transform(X[col])
+
+        if len(self.labels) == 1:
+            X = X[self.labels].values.reshape(-1, 1)
+        else:
+            X = X[self.labels]
+
+        self._ohe = OneHotEncoder(n_values=n_values, sparse=False)
+        self._ohe.fit(X)
 
         return self
 
@@ -221,41 +397,26 @@ class OneHotLabelEncoder(BaseEstimator, TransformerMixin):
         Parameters
         ----------
         X: DataFrame, shape = [n_samples, n_features]
-            Input DataFrame to be transformed. Must include column specified in
-            self.label.
+            Input DataFrame to be transformed.
 
         Returns
         -------
-        X: DataFrame, shape = [n_samples, n_features + n_encoded_features]
+        X_out: DataFrame, shape = [n_samples, (n_features +) encoded_features]
             Original DataFrame with OneHotLabelEncoder columns.
         '''
-        y = self._na_transform(X[self.label].copy())
+        X_out = X.copy()
+        self._transform_impute(X_out)
 
-        # Checks if there are unknown classes
-        unknown = set(y.unique()) - set(self._le.classes_)
+        for col in self.labels:
+            X_out[col] = self._le[col].transform(X_out[col])
 
-        # Checks if missing values found in transform and fit step did not
-        # handle missing values
-        if self.missing_fill in unknown:
-            missing_mask = y == self.missing_fill
-        elif str(self.missing_fill) in unknown:
-            missing_mask = y == str(self.missing_fill)
+        if len(self.labels) == 1:
+            X_out = X_out[self.labels].values.reshape(-1, 1)
         else:
-            missing_mask = None
+            X_out = X_out[self.labels]
 
-        data = self._unknown_transform(y, unknown)
-        data = self._ohe.transform(data.reshape(-1, 1))
+        X_out = pd.DataFrame(self._ohe.transform(X_out), index=X.index)
+        X_out = self._name_columns(X_out).astype(int)
+        X_out = self._select_columns(X, X_out)
 
-        classes = np.char.array(self._le.classes_)
-        ncols = data.shape[1]
-
-        data, ncols = self._output_missing_col(data, ncols,
-                                               missing_mask, classes)
-        data = pd.DataFrame(data, index=X.index,
-                            columns=self._label_transform(classes, ncols),
-                            dtype=int)
-
-        self._delete_columns(X, data)
-        X = pd.concat([X, data], axis=1)
-
-        return X
+        return X_out

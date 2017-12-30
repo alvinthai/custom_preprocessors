@@ -1,8 +1,7 @@
 # custom_preprocessors
 custom preprocessors for sklearn
 
-Readme in the works - check back soon!
-
 ## Encoders
 
-- **OneHotLabelEncoder** - A class for performing a label encoding and one hot encoding sequentially. Can handle numerical, categorical, and missing inputs. Also recodes any unknown inputs found in transform step as no found value for one hot encoding. Fit and transform objects MUST be pandas DataFrame.
+- **OneHotLabelEncoder** [Tutorial](http://nbviewer.jupyter.org/github/alvinthai/custom_preprocessors/blob/master/tutorials/OneHotLabelEncoder_Tutorial.ipynb)  
+  Automagically runs LabelEncoder and OneHotEncoder on categorical features in a pandas DataFrame. Robust to missing and unknown labels, and has advanced options for filtering out less common labels.
