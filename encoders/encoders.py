@@ -185,13 +185,24 @@ class TargetEncoder(BaseEstimator, TransformerMixin):
     unknown: numeric, optional, default: None
         Value to return when unknown category group found during transform.
         If None, uses the prior informed from the train set --> AGG(y)
+
+    bootstrap: bool, optional, default: True
+        If True, implements resampling with replacement. This helps reduce
+        overfitting to the train dataset.
+
+    random_state: int, optional, default: None
+        The seed of the pseudo random number generator to use when shuffling
+        the data. Only applicable if <bootstrap> is True.
     '''
-    def __init__(self, cols, smoothing_size=0, agg='mean', unknown=None):
+    def __init__(self, cols, smoothing_size=0, agg='mean', unknown=None,
+                 bootstrap=True, random_state=None):
         self.encoder_dict = {}
         self.cols = cols
         self.smoothing_size = smoothing_size
         self.agg = agg.title()
         self.unknown = defaultdict(lambda: unknown)
+        self.bootstrap = bootstrap
+        self.random_state = random_state
 
         if agg == 'mean':
             self.aggfunc = lambda x: x.mean()
@@ -235,6 +246,10 @@ class TargetEncoder(BaseEstimator, TransformerMixin):
             x = pd.DataFrame()
             x[col] = df[col]
             x['target'] = pd.Series(y)
+
+            if self.bootstrap:
+                x = x.sample(frac=1, replace=True,
+                             random_state=self.random_state)
 
             g = x.groupby(col)
             yagg = self.aggfunc(y)
