@@ -182,15 +182,16 @@ class TargetEncoder(BaseEstimator, TransformerMixin):
         - sum: 'sum'
         - quantile (input desired quantile in ##): 'q##'
 
-    unknown: numeric, optional, default: -1
+    unknown: numeric, optional, default: None
         Value to return when unknown category group found during transform.
+        If None, uses the prior informed from the train set --> AGG(y)
     '''
-    def __init__(self, cols, smoothing_size=0, agg='mean', unknown=-1):
+    def __init__(self, cols, smoothing_size=0, agg='mean', unknown=None):
         self.encoder_dict = {}
         self.cols = cols
         self.smoothing_size = smoothing_size
         self.agg = agg.title()
-        self.unknown = unknown
+        self.unknown = defaultdict(lambda: unknown)
 
         if agg == 'mean':
             self.aggfunc = lambda x: x.mean()
@@ -204,6 +205,7 @@ class TargetEncoder(BaseEstimator, TransformerMixin):
             self.aggfunc = lambda x: x.std()
         elif agg == 'sum':
             self.aggfunc = lambda x: x.sum()
+            self.unknown = defaultdict(lambda: -1)
         elif re.match('q[0-9]{1,2}$', agg) is not None:
             q = int(agg[1:])
             self.aggfunc = lambda x: x.quantile(q/100)
@@ -236,6 +238,9 @@ class TargetEncoder(BaseEstimator, TransformerMixin):
 
             g = x.groupby(col)
             yagg = self.aggfunc(y)
+
+            if self.unknown[col] is None:
+                self.unknown[col] = yagg
 
             g_df = pd.DataFrame(index=sorted(g.groups.keys()))
             g_df['agg'] = self.aggfunc(g)
@@ -276,7 +281,7 @@ class TargetEncoder(BaseEstimator, TransformerMixin):
 
         for col in self.cols:
             label = 'Target{}({})'.format(self.agg, col)
-            func = lambda x: self.encoder_dict[col].get(x, self.unknown)
+            func = lambda x: self.encoder_dict[col].get(x, self.unknown[col])
             df[label] = df[col].map(func)
 
         return df
