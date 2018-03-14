@@ -156,6 +156,7 @@ class GreedyForwardSelection(object):
 
         if feature_history is not None:
             self.feature_history = feature_history
+            assert len(self.feature_history) == len(self.good_features)
         elif len(self.good_features) > 0:
             self.feature_history = copy(self.good_features)
         else:
@@ -163,6 +164,7 @@ class GreedyForwardSelection(object):
 
         if score_history is not None:
             self.score_history = score_history
+            assert len(self.score_history) == len(self.good_features)
         elif len(self.good_features) > 0:
             self.score_history = [0] * len(self.good_features)
         else:
