@@ -199,29 +199,31 @@ class TargetEncoder(BaseEstimator, TransformerMixin):
         self.encoder_dict = {}
         self.cols = cols
         self.smoothing_size = smoothing_size
-        self.agg = agg.title()
-        self.unknown = defaultdict(lambda: unknown)
+        self.agg = agg
+        self.unknown = unknown
         self.bootstrap = bootstrap
         self.random_state = random_state
 
-        if agg == 'mean':
+        if self.agg == 'mean':
             self.aggfunc = lambda x: x.mean()
-        elif agg == 'median':
+        elif self.agg == 'median':
             self.aggfunc = lambda x: x.median()
-        elif agg == 'min':
+        elif self.agg == 'min':
             self.aggfunc = lambda x: x.min()
-        elif agg == 'max':
+        elif self.agg == 'max':
             self.aggfunc = lambda x: x.max()
-        elif agg == 'std':
+        elif self.agg == 'std':
             self.aggfunc = lambda x: x.std()
-        elif agg == 'sum':
+        elif self.agg == 'sum':
             self.aggfunc = lambda x: x.sum()
-            self.unknown = defaultdict(lambda: -1)
-        elif re.match('q[0-9]{1,2}$', agg) is not None:
-            q = int(agg[1:])
+            self.unknown_dict = defaultdict(lambda: -1)
+        elif re.match('q[0-9]{1,2}$', self.agg) is not None:
+            q = int(self.agg[1:])
             self.aggfunc = lambda x: x.quantile(q/100)
         else:
             raise ValueError('invalid value for {agg}')
+
+        self.unknown_dict = defaultdict(lambda: unknown)
 
     def fit(self, df, y):
         '''
@@ -254,8 +256,8 @@ class TargetEncoder(BaseEstimator, TransformerMixin):
             g = x.groupby(col)
             yagg = self.aggfunc(y)
 
-            if self.unknown[col] is None:
-                self.unknown[col] = yagg
+            if self.unknown_dict[col] is None:
+                self.unknown_dict[col] = yagg
 
             g_df = pd.DataFrame(index=sorted(g.groups.keys()))
             g_df['agg'] = self.aggfunc(g)
@@ -295,8 +297,9 @@ class TargetEncoder(BaseEstimator, TransformerMixin):
         df = df.copy()
 
         for col in self.cols:
-            label = 'Target{}({})'.format(self.agg, col)
-            func = lambda x: self.encoder_dict[col].get(x, self.unknown[col])
+            label = 'Target{}({})'.format(self.agg.title(), col)
+            dic = self.unknown_dict[col]
+            func = lambda x: self.encoder_dict[col].get(x, dic)
             df[label] = df[col].map(func)
 
         return df
