@@ -2,14 +2,19 @@ from __future__ import division
 from _monkeypatch_sklearn import monkeypatch_fit
 
 from collections import defaultdict
-from sklearn.metrics import make_scorer
-from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
+from copy import copy
+from sklearn.base import clone
+from sklearn.model_selection import (GridSearchCV, RandomizedSearchCV,
+                                     StratifiedKFold)
+from sklearn.model_selection._split import _BaseKFold
+from sklearn.pipeline import Pipeline
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import sklearn
+import types
 
 
 class BaseMultiMetricSearchCV(object):
@@ -144,48 +149,39 @@ class BinaryRandomizedSearchCV(BaseMultiMetricSearchCV, RandomizedSearchCV):
                                                  return_train_score)
 
 
-class DoubleThresholdCV(GridSearchCV):
-    def __init__(self, estimator, probas, param_grid=None, n_jobs=1, iid=True,
-                 refit=False, cv=None, verbose=0, transform_before_grid=False,
-                 pipeline_split_idx=None, high_thld=0.5):
-        assert sklearn.__version__ == '0.19.1'
-
+class DoubleThresholdCV(object):
+    def __init__(self, estimator, probas, cv=None, high_thld=0.5,
+                 pipeline_split_idx=None):
         self.probas = probas
-        self.transform_before_grid = transform_before_grid
-        self.pipeline_split_idx = pipeline_split_idx
         self.high_thld = high_thld
+        self.pipeline_split_idx = pipeline_split_idx
 
-        self.scoring = {}
-        high = high_thld
-        true_cnt = self._true_cnt
-        false_cnt = self._false_cnt
+        self.cv_is_func = False
+        self.pipeline = None
 
-        if param_grid is None:
-            self.param_grid = {}
+        if cv is None:
+            self.cv = StratifiedKFold(n_splits=4)
+        elif type(cv) == int and cv >= 2:
+            self.cv = StratifiedKFold(n_splits=cv)
+        elif type(cv) in [list, types.GeneratorType]:
+            self.cv = cv
+        elif isinstance(cv, _BaseKFold):
+            self.cv_is_func = True
+            self.cv = None
         else:
-            self.param_grid = param_grid
+            raise TypeError('Bad input for cv parameter.')
 
-        for val in self.probas:
-            tp_high = make_scorer(true_cnt, needs_proba=True, lte=1, gt=high)
-            fp_high = make_scorer(false_cnt, needs_proba=True, lte=1, gt=high)
-            tp_med = make_scorer(true_cnt, needs_proba=True, lte=high, gt=val)
-            fp_med = make_scorer(false_cnt, needs_proba=True, lte=high, gt=val)
-            tp_low = make_scorer(false_cnt, needs_proba=True, lte=val, gt=0)
-            fp_low = make_scorer(true_cnt, needs_proba=True, lte=val, gt=0)
+        if isinstance(estimator, Pipeline):
+            pre_pipe_steps = estimator.steps[:pipeline_split_idx]
+            new_pipe_steps = estimator.steps[pipeline_split_idx:]
+            self.pipeline = Pipeline(pre_pipe_steps)
 
-            val_dict = {'#tphigh'.format(val): tp_high,
-                        '#fphigh'.format(val): fp_high,
-                        '#tpmed@{}'.format(val): tp_med,
-                        '#fpmed@{}'.format(val): fp_med,
-                        '#tplow@{}'.format(val): tp_low,
-                        '#fplow@{}'.format(val): fp_low}
-
-            self.scoring.update(val_dict)
-
-        super(GridSearchCV, self).__init__(estimator, self.scoring, iid=iid,
-                                           fit_params=None, n_jobs=n_jobs,
-                                           refit=refit, cv=cv, verbose=verbose,
-                                           return_train_score=False)
+            if len(new_pipe_steps) == 1:
+                self.estimator = new_pipe_steps[0][1]
+            else:
+                self.estimator = Pipeline(new_pipe_steps)
+        else:
+            self.estimator = estimator
 
     @staticmethod
     def _false_cnt(y, y_proba, lte=1, gt=0.5):
@@ -215,8 +211,8 @@ class DoubleThresholdCV(GridSearchCV):
         return [self._f1_safe(x, y) for x, y in zip(precisions, recalls)]
 
     def _calculate_precision_recall_f1_high(self):
-        tphigh = self.cv_results_['mean_test_#tphigh'] * self.n_splits_
-        fphigh = self.cv_results_['mean_test_#fphigh'] * self.n_splits_
+        tphigh = sum(self.cv_results_['tphigh'])
+        fphigh = sum(self.cv_results_['fphigh'])
 
         tphigh, fphigh = int(round(tphigh)), int(round(fphigh))
 
@@ -231,14 +227,14 @@ class DoubleThresholdCV(GridSearchCV):
         self.thld_dict = defaultdict(dict)
 
         for key in self.cv_results_:
-            lbl = key.replace('#', '@').split('@')
+            lbl = key.split('@')
 
-            if len(lbl) == 3 and lbl[0] == 'mean_test_':
-                thld = float(lbl[2])
-                metric = lbl[1]
+            if len(lbl) == 2:
+                thld = float(lbl[1])
+                metric = lbl[0]
+                val = sum(self.cv_results_[key])
 
-                val = self.cv_results_[key] * self.n_splits_
-                self.thld_dict[thld][metric] = int(round(val))
+                self.thld_dict[thld][metric] = val
 
         self.thresholds = []
         precision_med, recall_med, pct_med = [], [], []
@@ -275,24 +271,95 @@ class DoubleThresholdCV(GridSearchCV):
         self.y_len = self.y_pos + self.y_neg
         self.y_mean = y.mean()
 
-        return monkeypatch_fit(self, X, y, groups, **fit_params)
+        high = self.high_thld
+        cv_results = defaultdict(list)
+
+        if self.cv_is_func:
+            splits = self.cv.split(X, y)
+        else:
+            splits = self.cv
+
+        if self.pipeline is not None:
+            X = self.pipeline.fit_transform(X)
+
+        sw_label, sample_weight = '', None
+
+        for pname in fit_params.keys():
+            step, param = pname.split('__', 1)
+
+            if param == 'sample_weight':
+                sw_label = pname
+                sample_weight = fit_params.pop(pname)
+
+        for (train_idx, test_idx) in splits:
+            est = clone(self.estimator)
+            cv_fit_params = copy(fit_params)
+
+            if isinstance(X, pd.DataFrame):
+                X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+                X_test, y_test = X.iloc[test_idx], y.iloc[test_idx]
+            else:
+                X_train, y_train = X[train_idx], y[train_idx]
+                X_test, y_test = X[test_idx], y[test_idx]
+
+            if sample_weight is not None:
+                if isinstance(sample_weight, pd.Series):
+                    cv_fit_params[sw_label] = sample_weight.iloc[train_idx]
+                else:
+                    cv_fit_params[sw_label] = sample_weight[train_idx]
+
+            est.fit(X_train, y_train, **cv_fit_params)
+
+            y_probas = est.predict_proba(X_test)
+
+            tphigh = self._true_cnt(y_test, y_probas, gt=high)
+            fphigh = self._false_cnt(y_test, y_probas, gt=high)
+
+            cv_results['tphigh'].append(tphigh)
+            cv_results['fphigh'].append(fphigh)
+
+            for val in self.probas:
+                tpmed = self._true_cnt(y_test, y_probas, lte=high, gt=val)
+                fpmed = self._false_cnt(y_test, y_probas, lte=high, gt=val)
+                tplow = self._false_cnt(y_test, y_probas, lte=val, gt=0)
+                fplow = self._true_cnt(y_test, y_probas, lte=val, gt=0)
+
+                cv_results['tpmed@{}'.format(val)].append(tpmed)
+                cv_results['fpmed@{}'.format(val)].append(fpmed)
+                cv_results['tplow@{}'.format(val)].append(tplow)
+                cv_results['fplow@{}'.format(val)].append(fplow)
+
+        self.cv_results_ = cv_results
+
+        return self
 
     def plot_thresholds(self):
         self._make_threshold_dict()
 
         sns.set()
+        f, axes = plt.subplots(ncols=2, figsize=(16, 1))
+
+        actual = pd.DataFrame([self.y_mean, 1-self.y_mean], columns=[''],
+                              index=['  actual_positive', 'actual_negative'])
+
+        for i, ax in enumerate(axes):
+            sns.heatmap(actual.iloc[i:i+1], annot=True, fmt=".1%",
+                        linewidths=.5, ax=ax, vmin=0, vmax=1,
+                        cbar=False, annot_kws={"size": 14}, square=True)
+            ax.yaxis.set_tick_params(rotation=0, labelsize=12)
+
         f, axes = plt.subplots(ncols=4, figsize=(16.7, 1))
 
         high_data = self._calculate_precision_recall_f1_high()
         high = pd.DataFrame(high_data, columns=[''],
-                            index=['precision_high', 'recall_high',
+                            index=['  precision_high ', 'recall_high',
                                    'f1_high', '%_traffic_high'])
 
         for i, ax in enumerate(axes):
             sns.heatmap(high.iloc[i:i+1], annot=True, fmt=".1%",
                         linewidths=.5, ax=ax, vmin=0, vmax=1,
                         cbar=False, annot_kws={"size": 14}, square=True)
-            ax.yaxis.set_tick_params(rotation=0, labelsize=14)
+            ax.yaxis.set_tick_params(rotation=0, labelsize=12)
 
         med_low = pd.DataFrame()
         med_low['precision_medium'] = self.precision_med
@@ -307,8 +374,9 @@ class DoubleThresholdCV(GridSearchCV):
 
         med_low = med_low.T
 
-        f, ax = plt.subplots(figsize=(18, 8))
+        f, ax = plt.subplots(figsize=(0.54 + 1.16 * med_low.shape[1], 8))
         sns.heatmap(med_low, annot=True, fmt=".1%", linewidths=.5, ax=ax,
-                    vmin=0, vmax=1)
+                    vmin=0, vmax=1, square=True)
         ax.yaxis.set_tick_params(rotation=0, labelsize=12)
+
         plt.show()
