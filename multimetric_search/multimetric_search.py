@@ -18,6 +18,11 @@ import types
 
 
 class BaseMultiMetricSearchCV(object):
+    '''
+    Base class for extending sklearn GridSearchCV and RandomizedSearchCV to
+    (1) Report cv_results_ attribute as DataFrame sorted by metric of interest.
+    (2) Accomodate reduction in transform steps for pipeline estimators.
+    '''
     def binary_params(self, scoring=None, show_train=False, show_std=False,
                       col_sort=None, result_sort=None,
                       transform_before_grid=False, pipeline_split_idx=None,
@@ -106,6 +111,11 @@ class BaseMultiMetricSearchCV(object):
 
 
 class BinaryGridSearchCV(BaseMultiMetricSearchCV, GridSearchCV):
+    '''
+    Extend GridSearchCV with BaseMultiMetricSearchCV.
+    Sets default evaluation parameters to report ROC AUC, Accuracy, Precision,
+    Recall, and F1 for each set of search hyperparameters.
+    '''
     def __init__(self, estimator, param_grid, scoring=None, fit_params=None,
                  n_jobs=1, iid=True, refit=False, cv=None, verbose=0,
                  pre_dispatch='2*n_jobs', error_score='raise',
@@ -126,6 +136,11 @@ class BinaryGridSearchCV(BaseMultiMetricSearchCV, GridSearchCV):
 
 
 class BinaryRandomizedSearchCV(BaseMultiMetricSearchCV, RandomizedSearchCV):
+    '''
+    Extend RandomizedSearchCV with BaseMultiMetricSearchCV.
+    Sets default evaluation parameters to report ROC AUC, Accuracy, Precision,
+    Recall, and F1 for each set of search hyperparameters.
+    '''
     def __init__(self, estimator, param_distributions, n_iter=10, scoring=None,
                  fit_params=None, n_jobs=1, iid=True, refit=False, cv=None,
                  verbose=0, pre_dispatch='2*n_jobs', random_state=None,
@@ -150,6 +165,23 @@ class BinaryRandomizedSearchCV(BaseMultiMetricSearchCV, RandomizedSearchCV):
 
 
 class DoubleThresholdCV(object):
+    '''
+    Custom class for evaluating precision/recall/f1/volume for a range of
+    secondary thresholds below a higher threshold with cross-validation model
+    training.
+
+    Precision/recall/f1 for values above high threshold are for positive class.
+    Precision/recall/f1 for values between high and medium threshold are also
+        for positive class.
+    Precision/recall/f1 for values below medium threshold are for negative
+        class.
+
+    Overall results are plotted by calling the plot_thresholds method after
+    fitting the training data.
+
+    This class is also coded to optionally support cross-validation of pipeline
+    estimators that depend on target variables for fitting.
+    '''
     def __init__(self, estimator, probas, cv=None, high_thld=0.5,
                  pipeline_split_idx=None):
         self.probas = probas
